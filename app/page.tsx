@@ -1,11 +1,14 @@
-"use client"
-import React, { useState } from 'react';
+"use client";
+import React, { useEffect, useState } from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Mail, MessageSquare, Network, CheckCircle2, AlertTriangle, BarChart, Upload, FileJson } from 'lucide-react';
+import { useClassificationQueries } from '../hooks/useClassificationQueries';
+import { useQueries, QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import axios from 'axios';
 
-// TypeScript interfaces
+// TypeScript interfaces (declare your interfaces here)
 interface EmailAddress {
   address: string;
   name?: string;
@@ -69,13 +72,14 @@ interface IterationResult {
   questions: Record<string, Question[]> | Question[] | null;
   additional_context: string[] | null;
 }
+
 interface ClassificationProcess {
   iterations: IterationResult[];
   total_iterations: number;
   final_result: Classification;
 }
 
-interface EmailClassificationResult {
+export interface EmailClassificationResult {
   email_details: EmailDetails;
   domain_analysis: DomainAnalysis;
   initial_classification: Classification;
@@ -91,83 +95,115 @@ interface ApiResponse {
   next_skip?: number;
 }
 
-const ClassificationDashboard = () => {
+const API_BASE_URL = 'http://localhost:8000';
+
+const queryClient = new QueryClient();
+
+const ClassificationDashboardWrapper = () => {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <ClassificationDashboardContent />
+    </QueryClientProvider>
+  );
+};
+
+const ClassificationDashboardContent = () => {
   // State management
-  const [apiResults, setApiResults] = useState<EmailClassificationResult[]>([]);
   const [jsonResults, setJsonResults] = useState<EmailClassificationResult[]>([]);
-  const [activeDataSource, setActiveDataSource] = useState('api'); // 'api' or 'json'
+  const [activeDataSource, setActiveDataSource] = useState<'api' | 'json'>('api');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
-  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [currentSkip, setCurrentSkip] = useState(800);
   const [hasMore, setHasMore] = useState(true);
   const [jsonFileUploaded, setJsonFileUploaded] = useState(false);
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [activeTaskIds, setActiveTaskIds] = useState<string[]>([]);
 
-  // Get current results based on active data source
-  const getCurrentResults = () => {
-    return activeDataSource === 'api' ? apiResults : jsonResults;
+  // Use API results from our custom hook
+  const { resultsQuery, processEmailsMutation } = useClassificationQueries({
+    queryClient,
+    skip: currentSkip,
+    limit: 50,
+    category: null,
+  });
+
+  // Use useQueries to monitor task statuses
+  const taskStatusQueries = useQueries({
+    queries: activeTaskIds.map(taskId => ({
+      queryKey: ['taskStatus', taskId],
+      queryFn: async () => {
+        const response = await axios.get(`${API_BASE_URL}/task-status/${taskId}`);
+        return response.data;
+      },
+      enabled: Boolean(taskId),
+      refetchInterval: 3000,
+    })),
+  });
+
+  // Remove tasks that have completed
+  useEffect(() => {
+    const completedTaskIds = taskStatusQueries
+      .filter(query => query.data && query.data.status === 'completed')
+      .map((_, index) => activeTaskIds[index]);
+    if (completedTaskIds.length > 0) {
+      setActiveTaskIds(prev => prev.filter(id => !completedTaskIds.includes(id)));
+    }
+  }, [taskStatusQueries, activeTaskIds]);
+
+  // Helper function to get current results (from API or JSON)
+  const getCurrentResults = (): EmailClassificationResult[] => {
+    return activeDataSource === 'api'
+      ? (resultsQuery.data?.results || [])
+      : jsonResults;
   };
 
-  // Function to filter results by category
-  const getFilteredResults = () => {
+  // Helper to filter results by selected category
+  const getFilteredResults = (): EmailClassificationResult[] => {
     const currentResults = getCurrentResults();
     if (!selectedCategory) return currentResults;
-    return currentResults.filter(
-      result => result?.classification_process?.final_result?.category === selectedCategory
+    
+    return currentResults.filter(result => 
+      result.classification_process?.final_result?.category === selectedCategory
     );
   };
 
-  // Function to clear category filter
   const clearCategoryFilter = () => {
     setSelectedCategory(null);
   };
 
-  // Function to handle JSON file upload
-  const handleFileUpload = (event: any) => {
-    const file = event.target.files[0];
+  // File upload handler for JSON results
+  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
     if (!file) return;
-  
+
     setLoading(true);
     setError(null);
-  
+
     const reader = new FileReader();
     reader.onload = (e) => {
       try {
-        const content = e.target?.result;
-        const jsonData = JSON.parse(content as string);
-        
+        const content = e.target?.result as string;
+        const jsonData = JSON.parse(content);
         console.log("Loaded JSON data:", typeof jsonData);
-        
-        // Case 1: Direct array of email classification results
+
         if (Array.isArray(jsonData)) {
-          console.log("Found direct array with", jsonData.length, "items");
           setJsonResults(jsonData);
           setJsonFileUploaded(true);
           setActiveDataSource('json');
-        } 
-        // Case 2: Object containing a results array
-        else if (jsonData && jsonData.results && Array.isArray(jsonData.results)) {
-          console.log("Found object with results array containing", jsonData.results.length, "items");
+        } else if (jsonData && jsonData.results && Array.isArray(jsonData.results)) {
           setJsonResults(jsonData.results);
           setJsonFileUploaded(true);
           setActiveDataSource('json');
-        }
-        // Case 3: Object with status and results array (matches your API format)
-        else if (jsonData && typeof jsonData === 'object' && jsonData.status && jsonData.results) {
-          console.log("Found API-like response object with", jsonData.results.length, "items");
+        } else if (jsonData && typeof jsonData === 'object' && jsonData.status && jsonData.results) {
           setJsonResults(jsonData.results);
           setJsonFileUploaded(true);
           setActiveDataSource('json');
-        }
-        // Case 4: Single result object that needs to be wrapped in an array
-        else if (jsonData && typeof jsonData === 'object' && !Array.isArray(jsonData)) {
-          console.log("Found single object, wrapping in array");
+        } else if (jsonData && typeof jsonData === 'object' && !Array.isArray(jsonData)) {
           setJsonResults([jsonData]);
           setJsonFileUploaded(true);
           setActiveDataSource('json');
-        } 
-        else {
+        } else {
           setError('Unrecognized JSON format. Please ensure the file contains email classification results.');
         }
       } catch (err) {
@@ -177,74 +213,32 @@ const ClassificationDashboard = () => {
         setLoading(false);
       }
     };
-  
+
     reader.onerror = () => {
       setError('Error reading file.');
       setLoading(false);
     };
-  
+
     reader.readAsText(file);
   };
 
   const classifyBulkEmails = async () => {
-    setLoading(true);
-    setError(null);
-    
     try {
-      // Use the currentSkip value in the API request
-      const response = await fetch(`http://localhost:8000/process-emails?skip=${currentSkip}&batch_size=5`, {
-        method: 'POST',
+      setLoading(true);
+      const result = await processEmailsMutation.mutateAsync({
+        totalEmails: 100,
+        batchSize: 50,
+        skip: currentSkip,
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.detail || `HTTP error! status: ${response.status}`);
+      if (result.task_ids) {
+        setActiveTaskIds(prev => [...prev, ...result.task_ids]);
       }
-
-      const data = await response.json();
-      
-      if (data.status === 'no_emails') {
-        setHasMore(false);
-        setLoading(false);
-        return;
-      }
-      
-      if (data.results && data.results.length > 0) {
-        setApiResults(prevResults => [...prevResults, ...data.results]);
-        setProgress(prevProgress => prevProgress + data.results.length);
-        
-        // Critical fix: Use the next_skip value from the response
-        if (data.next_skip) {
-          console.log(`Updating skip from ${currentSkip} to ${data.next_skip}`);
-          setCurrentSkip(data.next_skip);
-        } else {
-          // Fallback in case next_skip is not provided
-          setCurrentSkip(prevSkip => prevSkip + data.results.length);
-        }
-      } else {
-        setHasMore(false);
-      }
-      
-    } catch (err) {
-      console.error(err);
-      // setError(err.message || 'An error occurred while classifying emails.');
+    } catch (err: any) {
+      setError(err.message || 'An error occurred while processing emails');
     } finally {
       setLoading(false);
     }
-  };
-
-  const resetProcessing = () => {
-    if (activeDataSource === 'api') {
-      setApiResults([]);
-      setProgress(0);
-      setCurrentSkip(0);
-      setHasMore(true);
-    } else {
-      setJsonResults([]);
-      setJsonFileUploaded(false);
-    }
-    setError(null);
-    setSelectedCategory(null);
   };
 
   const getConfidenceColor = (confidence: number) => {
@@ -253,36 +247,54 @@ const ClassificationDashboard = () => {
     return 'bg-red-100 text-red-800';
   };
 
-  // Get category summary based on current results
-  const getCategorySummary = () => {
-    const results = getCurrentResults();
-    return results.reduce((acc, result) => {
-      // Safely access nested properties with optional chaining
-      const category = result?.classification_process?.final_result?.category || 'Unknown';
-      acc[category] = (acc[category] || 0) + 1;
-      return acc;
-    }, {} as Record<string, number>);
+  const resetProcessing = () => {
+    setCurrentSkip(0);
+    setSelectedCategory(null);
+    setError(null);
+    queryClient.invalidateQueries({ queryKey: ['classificationResults'] });
   };
+
+  if (resultsQuery.isLoading) {
+    return <div>Loading...</div>;
+  }
+
+  if (resultsQuery.error) {
+    return <div>Error: {resultsQuery.error.message}</div>;
+  }
+
+  // Get category summary for display
+  const getCategorySummary = () => {
+    const summary: { [key: string]: number } = {};
+    const currentResults = getCurrentResults();
+    
+    currentResults.forEach(result => {
+      const category = result.classification_process?.final_result?.category || 'Unknown';
+      summary[category] = (summary[category] || 0) + 1;
+    });
+    
+    return summary;
+  };
+
+  // Get the filtered results for display
+  const filteredResults = getFilteredResults();
 
   return (
     <div className="max-w-7xl mx-auto p-6 space-y-6">
+      {/* Data Source Controls */}
       <div className="flex justify-between items-center">
         <h1 className="text-3xl font-bold">Email Classification Dashboard</h1>
         <div className="flex items-center gap-4">
           {activeDataSource === 'api' && progress > 0 && (
-            <div className="text-sm text-gray-600">
-              Processed: {progress} emails
-            </div>
+            <div className="text-sm text-gray-600">Processed: {progress} emails</div>
           )}
-          
-          {/* Data source toggle buttons */}
+
           <div className="flex rounded-md shadow-sm" role="group">
             <button
               type="button"
               onClick={() => setActiveDataSource('api')}
               className={`px-4 py-2 text-sm font-medium rounded-l-lg ${
-                activeDataSource === 'api' 
-                  ? 'bg-blue-600 text-white' 
+                activeDataSource === 'api'
+                  ? 'bg-blue-600 text-white'
                   : 'bg-white text-gray-700 hover:bg-gray-50'
               } border border-gray-200`}
             >
@@ -292,18 +304,18 @@ const ClassificationDashboard = () => {
               type="button"
               onClick={() => setActiveDataSource('json')}
               className={`px-4 py-2 text-sm font-medium rounded-r-lg ${
-                activeDataSource === 'json' 
-                  ? 'bg-blue-600 text-white' 
+                activeDataSource === 'json'
+                  ? 'bg-blue-600 text-white'
                   : 'bg-white text-gray-700 hover:bg-gray-50'
               } border border-l-0 border-gray-200`}
             >
               JSON File
             </button>
           </div>
-          
+
           {activeDataSource === 'api' ? (
-            <Button 
-              onClick={classifyBulkEmails} 
+            <Button
+              onClick={classifyBulkEmails}
               disabled={loading || !hasMore}
               className="flex items-center gap-2"
             >
@@ -317,24 +329,20 @@ const ClassificationDashboard = () => {
                   <FileJson className="h-4 w-4" />
                   <span>{jsonFileUploaded ? 'Upload Another JSON' : 'Upload JSON File'}</span>
                 </div>
-                <input 
-                  type="file" 
-                  id="json-upload" 
-                  accept=".json" 
-                  onChange={handleFileUpload} 
-                  className="hidden" 
+                <input
+                  type="file"
+                  id="json-upload"
+                  accept=".json"
+                  onChange={handleFileUpload}
+                  className="hidden"
                   disabled={loading}
                 />
               </label>
             </div>
           )}
-          
+
           {((activeDataSource === 'api' && progress > 0) || (activeDataSource === 'json' && jsonFileUploaded)) && (
-            <Button 
-              onClick={resetProcessing}
-              variant="outline"
-              disabled={loading}
-            >
+            <Button onClick={resetProcessing} variant="outline" disabled={loading}>
               Reset
             </Button>
           )}
@@ -348,40 +356,6 @@ const ClassificationDashboard = () => {
         </Alert>
       )}
 
-      {/* Results Content */}
-      {activeDataSource === 'api' && apiResults.length === 0 && !loading && (
-        <div className="text-center p-12 border-2 border-dashed rounded-lg">
-          <Mail className="h-12 w-12 mx-auto text-gray-400 mb-4" />
-          <p className="text-lg font-medium text-gray-900">No API data available</p>
-          <p className="text-sm text-gray-500 mt-2 mb-6">
-            Click "Process Next Batch" to fetch email classification data
-          </p>
-        </div>
-      )}
-
-      {activeDataSource === 'json' && jsonResults.length === 0 && !loading && (
-        <div className="text-center p-12 border-2 border-dashed rounded-lg">
-          <Upload className="h-12 w-12 mx-auto text-gray-400 mb-4" />
-          <p className="text-lg font-medium text-gray-900">Upload your JSON file</p>
-          <p className="text-sm text-gray-500 mt-2 mb-6">
-            Drag and drop your JSON file or click the button to select a file
-          </p>
-          <label htmlFor="json-upload-inline" className="cursor-pointer">
-            <div className="inline-flex items-center gap-2 bg-primary text-primary-foreground hover:bg-primary/90 px-4 py-2 rounded-md">
-              <FileJson className="h-4 w-4" />
-              <span>Select JSON File</span>
-            </div>
-            <input 
-              type="file" 
-              id="json-upload-inline" 
-              accept=".json" 
-              onChange={handleFileUpload} 
-              className="hidden" 
-            />
-          </label>
-        </div>
-      )}
-
       {/* Category Summary Card */}
       {getCurrentResults().length > 0 && (
         <Card>
@@ -391,12 +365,7 @@ const ClassificationDashboard = () => {
               Category Summary {activeDataSource === 'api' ? '(API Data)' : '(JSON File)'}
             </CardTitle>
             {selectedCategory && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={clearCategoryFilter}
-                className="text-sm"
-              >
+              <Button variant="outline" size="sm" onClick={clearCategoryFilter} className="text-sm">
                 Clear Filter
               </Button>
             )}
@@ -407,8 +376,9 @@ const ClassificationDashboard = () => {
                 <div
                   key={category}
                   onClick={() => setSelectedCategory(category)}
-                  className={`bg-gray-50 p-4 rounded-lg shadow cursor-pointer transition-colors
-                    ${selectedCategory === category ? 'ring-2 ring-blue-500 bg-blue-50' : 'hover:bg-gray-100'}`}
+                  className={`bg-gray-50 p-4 rounded-lg shadow cursor-pointer transition-colors ${
+                    selectedCategory === category ? 'ring-2 ring-blue-500 bg-blue-50' : 'hover:bg-gray-100'
+                  }`}
                 >
                   <div className="text-sm font-medium text-gray-500">{category}</div>
                   <div className="mt-1 text-2xl font-semibold">{count}</div>
@@ -419,7 +389,7 @@ const ClassificationDashboard = () => {
               <span>Total Emails: {getCurrentResults().length}</span>
               {selectedCategory && (
                 <span className="font-medium">
-                  Showing {getFilteredResults().length} {selectedCategory} emails
+                  Showing {filteredResults.length} {selectedCategory} emails
                 </span>
               )}
             </div>
@@ -427,252 +397,266 @@ const ClassificationDashboard = () => {
         </Card>
       )}
 
-      {/* Display Results */}
-      {getFilteredResults().map((result, idx) => (
-        <div key={`${result?.email_details?.id || idx}-${idx}`} className="space-y-6">
-          {/* Email Details Card */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Mail className="h-5 w-5" />
-                Email Details
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="grid gap-4">
-                <div>
-                  <p className="font-semibold">Subject:</p>
-                  <p className="text-gray-600">{result?.email_details?.subject || 'N/A'}</p>
-                </div>
-                <div>
-                  <p className="font-semibold">From:</p>
-                  <p className="text-gray-600">{result?.email_details?.sender || 'N/A'}</p>
-                </div>
-                <div>
-                  <p className="font-semibold">To:</p>
-                  <p className="text-gray-600">
-                    {result?.email_details?.recipients?.map(r => r?.emailAddress?.address).join(', ') || 'N/A'}
-                  </p>
-                </div>
-                <div>
-                  <p className="font-semibold">Body:</p>
-                  <p className="text-gray-600 whitespace-pre-wrap">{result?.email_details?.body || 'N/A'}</p>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-          
-          {/* Domain Analysis */}
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Network className="h-5 w-5" />
-                Domain Analysis
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="space-y-4">
-                <div className="grid grid-cols-2 gap-4">
+      {/* Display Results - Key fix: Use filteredResults consistently */}
+      {filteredResults.length > 0 ? (
+        filteredResults.map((result, idx) => (
+          <div key={`${result?.email_details?.id || idx}-${idx}`} className="space-y-6">
+            {/* Render Email Details Card */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Mail className="h-5 w-5" />
+                  Email Details
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="grid gap-4">
                   <div>
-                    <p className="font-semibold">Sender Domain:</p>
-                    <p className="text-gray-600">{result?.domain_analysis?.sender_domain || 'N/A'}</p>
+                    <p className="font-semibold">Subject:</p>
+                    <p className="text-gray-600">{result?.email_details?.subject || 'N/A'}</p>
                   </div>
                   <div>
-                    <p className="font-semibold">Is Company Sender:</p>
-                    <span className={`px-2 py-1 rounded-full ${result?.domain_analysis?.sender_is_company ? 'bg-green-100 text-green-800' : 'bg-gray-100 text-gray-800'}`}>
-                      {result?.domain_analysis?.sender_is_company ? 'Yes' : 'No'}
+                    <p className="font-semibold">From:</p>
+                    <p className="text-gray-600">{result?.email_details?.sender || 'N/A'}</p>
+                  </div>
+                  <div>
+                    <p className="font-semibold">To:</p>
+                    <p className="text-gray-600">
+                      {result?.email_details?.recipients?.map(r => r?.emailAddress?.address).join(', ') || 'N/A'}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="font-semibold">Body:</p>
+                    <p className="text-gray-600 whitespace-pre-wrap text-wrap">{result?.email_details?.body || 'N/A'}</p>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Render Domain Analysis Card */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Network className="h-5 w-5" />
+                  Domain Analysis
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-4">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <p className="font-semibold">Sender Domain:</p>
+                      <p className="text-gray-600">{result?.domain_analysis?.sender_domain || 'N/A'}</p>
+                    </div>
+                    <div>
+                      <p className="font-semibold">Is Company Sender:</p>
+                      <span
+                        className={`px-2 py-1 rounded-full ${
+                          result?.domain_analysis?.sender_is_company
+                            ? 'bg-green-100 text-green-800'
+                            : 'bg-gray-100 text-gray-800'
+                        }`}
+                      >
+                        {result?.domain_analysis?.sender_is_company ? 'Yes' : 'No'}
+                      </span>
+                    </div>
+                  </div>
+                  <div>
+                    <p className="font-semibold">Analysis Reasoning:</p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      {result?.domain_analysis?.reasoning?.map((reason, index) => (
+                        <li key={index} className="text-gray-600">
+                          {reason}
+                        </li>
+                      )) || <li className="text-gray-600">No reasoning available</li>}
+                    </ul>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Render Initial Classification Card */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <MessageSquare className="h-5 w-5" />
+                  Initial Classification
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                <div className="space-y-4">
+                  <div className="flex items-center gap-2">
+                    <span className="font-semibold">Category:</span>
+                    <span className="px-2 py-1 rounded-full bg-blue-100 text-blue-800">
+                      {result?.initial_classification?.category || 'Unknown'}
                     </span>
                   </div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-semibold">Confidence:</span>
+                    <span className={`px-2 py-1 rounded-full ${getConfidenceColor(result?.initial_classification?.confidence || 0)}`}>
+                      {((result?.initial_classification?.confidence || 0) * 100).toFixed(0)}%
+                    </span>
+                  </div>
+                  <div>
+                    <p className="font-semibold">Uncertainty Points:</p>
+                    {result?.initial_classification?.uncertainty_points &&
+                    result.initial_classification.uncertainty_points.length > 0 ? (
+                      <ul className="list-disc pl-5 space-y-1">
+                        {result.initial_classification.uncertainty_points.map((point, index) => (
+                          <li key={index} className="text-gray-600">
+                            {point}
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="text-gray-600 ml-5">No uncertainty points</p>
+                    )}
+                  </div>
                 </div>
-                <div>
-                  <p className="font-semibold">Analysis Reasoning:</p>
-                  <ul className="list-disc pl-5 space-y-1">
-                    {result?.domain_analysis?.reasoning?.map((reason, index) => (
-                      <li key={index} className="text-gray-600">{reason}</li>
-                    )) || <li className="text-gray-600">No reasoning available</li>}
-                  </ul>
-                </div>
-              </div>
-            </CardContent>
-          </Card>
+              </CardContent>
+            </Card>
 
-          {/* Initial Classification */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <MessageSquare className="h-5 w-5" />
-                Initial Classification
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="space-y-4">
-                <div className="flex items-center gap-2">
-                  <span className="font-semibold">Category:</span>
-                  <span className="px-2 py-1 rounded-full bg-blue-100 text-blue-800">
-                    {result?.initial_classification?.category || 'Unknown'}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="font-semibold">Confidence:</span>
-                  <span className={`px-2 py-1 rounded-full ${getConfidenceColor(result?.initial_classification?.confidence || 0)}`}>
-                    {((result?.initial_classification?.confidence || 0) * 100).toFixed(0)}%
-                  </span>
-                </div>
-                <div>
-                  <p className="font-semibold">Uncertainty Points:</p>
-                  {result?.initial_classification?.uncertainty_points && result.initial_classification.uncertainty_points.length > 0 ? (
-                    <ul className="list-disc pl-5 space-y-1">
-                      {result.initial_classification.uncertainty_points.map((point, index) => (
-                        <li key={index} className="text-gray-600">{point}</li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="text-gray-600 ml-5">No uncertainty points</p>
-                  )}
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-
-          {/* Classification Process */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <BarChart className="h-5 w-5" />
-                Classification Process
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              {result?.classification_process?.iterations ? (
-                <div className="space-y-6">
-                  {result.classification_process.iterations.map((iteration, index) => (
-                    <div key={index} className="border rounded-lg p-4">
-                      <h3 className="text-lg font-semibold mb-4">
-                        Iteration {iteration?.iteration || index}
-                      </h3>
-                      <div className="space-y-4">
-                        <div>
-                          <p className="font-semibold">Classification:</p>
-                          <div className="ml-4 space-y-2">
-                            <div className="flex items-center gap-2">
-                              <span>Category:</span>
-                              <span className="px-2 py-1 rounded-full bg-blue-100 text-blue-800">
-                                {iteration?.classification?.category || 'Unknown'}
-                              </span>
+            {/* Render Classification Process Card */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <BarChart className="h-5 w-5" />
+                  Classification Process
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {result?.classification_process?.iterations ? (
+                  <div className="space-y-6">
+                    {result.classification_process.iterations.map((iteration, index) => (
+                      <div key={index} className="border rounded-lg p-4">
+                        <h3 className="text-lg font-semibold mb-4">Iteration {iteration?.iteration || index}</h3>
+                        <div className="space-y-4">
+                          <div>
+                            <p className="font-semibold">Classification:</p>
+                            <div className="ml-4 space-y-2">
+                              <div className="flex items-center gap-2">
+                                <span>Category:</span>
+                                <span className="px-2 py-1 rounded-full bg-blue-100 text-blue-800">
+                                  {iteration?.classification?.category || 'Unknown'}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <span>Confidence:</span>
+                                <span className={`px-2 py-1 rounded-full ${getConfidenceColor(iteration?.classification?.confidence || 0)}`}>
+                                  {((iteration?.classification?.confidence || 0) * 100).toFixed(0)}%
+                                </span>
+                              </div>
+                              <div>
+                                <p className="font-semibold">Rationale:</p>
+                                <p className="text-gray-600">{iteration?.classification?.rationale || 'No rationale provided'}</p>
+                              </div>
                             </div>
-                            <div className="flex items-center gap-2">
-                              <span>Confidence:</span>
-                              <span className={`px-2 py-1 rounded-full ${getConfidenceColor(iteration?.classification?.confidence || 0)}`}>
-                                {((iteration?.classification?.confidence || 0) * 100).toFixed(0)}%
-                              </span>
-                            </div>
+                          </div>
+                          {iteration?.questions && (
                             <div>
-                              <p className="font-semibold">Rationale:</p>
-                              <p className="text-gray-600">{iteration?.classification?.rationale || 'No rationale provided'}</p>
+                              <p className="font-semibold">Questions Generated:</p>
+                              <div className="ml-4">
+                                {Array.isArray(iteration.questions) ? (
+                                  <ul className="list-disc pl-5">
+                                    {iteration.questions.map((q, i) => (
+                                      <li key={i} className="text-gray-600">
+                                        {typeof q === 'object' && q !== null && 'question' in q ? q.question : String(q)}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                ) : (
+                                  Object.entries(iteration.questions).map(([stage, questions]) => (
+                                    <div key={stage} className="mt-2">
+                                      <p className="font-medium">{stage.replace(/_/g, ' ')}:</p>
+                                      <ul className="list-disc pl-5">
+                                        {Array.isArray(questions) &&
+                                          questions.map((q, i) => (
+                                            <li key={i} className="text-gray-600">
+                                              {typeof q === 'object' && q !== null && 'question' in q ? q.question : String(q)}
+                                            </li>
+                                          ))}
+                                      </ul>
+                                    </div>
+                                  ))
+                                )}
+                              </div>
                             </div>
-                          </div>
+                          )}
+                          {iteration?.additional_context && iteration.additional_context.length > 0 && (
+                            <div>
+                              <p className="font-semibold">Additional Context:</p>
+                              <ul className="list-disc pl-5">
+                                {iteration.additional_context.map((context, i) => (
+                                  <li key={i} className="text-gray-600">{context}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
                         </div>
-
-                        {iteration?.questions && (
-                          <div>
-                            <p className="font-semibold">Questions Generated:</p>
-                            <div className="ml-4">
-                              {Array.isArray(iteration.questions) ? (
-                                <ul className="list-disc pl-5">
-                                  {iteration.questions.map((q, i) => (
-                                    <li key={i} className="text-gray-600">
-                                      {typeof q === 'object' && q !== null && 'question' in q 
-                                        ? q.question 
-                                        : String(q)}
-                                    </li>
-                                  ))}
-                                </ul>
-                              ) : (
-                                Object.entries(iteration.questions).map(([stage, questions]) => (
-                                  <div key={stage} className="mt-2">
-                                    <p className="font-medium">{stage.replace(/_/g, ' ')}:</p>
-                                    <ul className="list-disc pl-5">
-                                      {Array.isArray(questions) && questions.map((q, i) => (
-                                        <li key={i} className="text-gray-600">
-                                          {typeof q === 'object' && q !== null && 'question' in q 
-                                            ? q.question 
-                                            : String(q)}
-                                        </li>
-                                      ))}
-                                    </ul>
-                                  </div>
-                                ))
-                              )}
-                            </div>
-                          </div>
-                        )}
-
-                        {iteration?.additional_context && iteration.additional_context.length > 0 && (
-                          <div>
-                            <p className="font-semibold">Additional Context:</p>
-                            <ul className="list-disc pl-5">
-                              {iteration.additional_context.map((context, i) => (
-                                <li key={i} className="text-gray-600">{context}</li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
                       </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-gray-600">No classification process information available</p>
-              )}
-            </CardContent>
-          </Card>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-gray-600">No classification process information available</p>
+                )}
+              </CardContent>
+            </Card>
 
-          {/* Similar Emails */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <CheckCircle2 className="h-5 w-5" />
-                Similar Emails
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              {result?.similar_emails && result.similar_emails.length > 0 ? (
-                <div className="overflow-x-auto">
-                  <table className="min-w-full divide-y divide-gray-200">
-                    <thead>
-                      <tr>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Subject</th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">From</th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
-                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Score</th>
-                      </tr>
-                    </thead>
-                    <tbody className="bg-white divide-y divide-gray-200">
-                      {result.similar_emails.map((email, index) => (
-                        <tr key={index}>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{email?.Subject || 'N/A'}</td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{email?.From || 'N/A'}</td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                            {email?.Date ? new Date(email.Date).toLocaleString() : 'N/A'}
-                          </td>
-                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                            {email?.Score ? `${(parseFloat(email.Score) * 100).toFixed(0)}%` : 'N/A'}
-                          </td>
+            {/* Render Similar Emails Card */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <CheckCircle2 className="h-5 w-5" />
+                  Similar Emails
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {result?.similar_emails && result.similar_emails.length > 0 ? (
+                  <div className="overflow-x-auto">
+                    <table className="min-w-full divide-y divide-gray-200">
+                      <thead>
+                        <tr>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Subject</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">From</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
+                          <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Score</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              ) : (
-                <p className="text-gray-600">No similar emails found</p>
-              )}
-            </CardContent>
-          </Card>
-        </div>
-      ))}
+                      </thead>
+                      <tbody className="bg-white divide-y divide-gray-200">
+                        {result.similar_emails.map((email, index) => (
+                          <tr key={index}>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{email?.Subject || 'N/A'}</td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{email?.From || 'N/A'}</td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                              {email?.Date ? new Date(email.Date).toLocaleString() : 'N/A'}
+                            </td>
+                            <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                              {email?.Score ? `${(parseFloat(email.Score) * 100).toFixed(0)}%` : 'N/A'}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className="text-gray-600">No similar emails found</p>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        ))
+      ) : (
+        getCurrentResults().length > 0 && selectedCategory ? (
+          <div className="text-center py-8">
+            <p className="text-lg text-gray-600">No emails found in the "{selectedCategory}" category.</p>
+            <Button onClick={clearCategoryFilter} variant="outline" className="mt-4">
+              Clear Filter
+            </Button>
+          </div>
+        ) : null
+      )}
     </div>
   );
 };
 
-export default ClassificationDashboard;
+export default ClassificationDashboardWrapper;
