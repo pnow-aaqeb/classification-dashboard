@@ -4,9 +4,10 @@ import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Mail, MessageSquare, Network, CheckCircle2, AlertTriangle, BarChart, Upload, FileJson } from 'lucide-react';
-import { useClassificationQueries } from '../hooks/useClassificationQueries';
+import { useClassificationResults } from '../hooks/useClassificationResults';
 import { useQueries, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import axios from 'axios';
+import { useEmailProcessing } from '@/hooks/useEmailProcessing';
 
 // TypeScript interfaces (declare your interfaces here)
 interface EmailAddress {
@@ -114,31 +115,33 @@ const ClassificationDashboardContent = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
-  const [currentSkip, setCurrentSkip] = useState(800);
+  const [currentSkip, setCurrentSkip] = useState(30);
   const [hasMore, setHasMore] = useState(true);
   const [jsonFileUploaded, setJsonFileUploaded] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [activeTaskIds, setActiveTaskIds] = useState<string[]>([]);
+  const [currentDisplaySkip, setCurrentDisplaySkip] = useState(0);
+  const [currentDisplayLimit, setCurrentDisplayLimit] = useState(1500);
+  const [processingSkip, setProcessingSkip] = useState(1230);
+  const [processingBatchSize, setProcessingBatchSize] = useState(100);
 
   // Use API results from our custom hook
-  const { resultsQuery, processEmailsMutation } = useClassificationQueries({
-    queryClient,
-    skip: currentSkip,
-    limit: 50,
-    category: null,
+  const { data: resultsData,isError,isLoading } = useClassificationResults({
+    skip: currentDisplaySkip,
+    limit: currentDisplayLimit,
+    // category: selectedCategory
   });
+
+  const processEmailsMutation = useEmailProcessing(queryClient);
 
   // Use useQueries to monitor task statuses
   const taskStatusQueries = useQueries({
     queries: activeTaskIds.map(taskId => ({
       queryKey: ['taskStatus', taskId],
-      queryFn: async () => {
-        const response = await axios.get(`${API_BASE_URL}/task-status/${taskId}`);
-        return response.data;
-      },
+      queryFn: () => axios.get(`${API_BASE_URL}/task-status/${taskId}`).then(res => res.data),
       enabled: Boolean(taskId),
       refetchInterval: 3000,
-    })),
+    }))
   });
 
   // Remove tasks that have completed
@@ -154,7 +157,7 @@ const ClassificationDashboardContent = () => {
   // Helper function to get current results (from API or JSON)
   const getCurrentResults = (): EmailClassificationResult[] => {
     return activeDataSource === 'api'
-      ? (resultsQuery.data?.results || [])
+      ? (resultsData?.results || [])
       : jsonResults;
   };
 
@@ -163,10 +166,12 @@ const ClassificationDashboardContent = () => {
     const currentResults = getCurrentResults();
     if (!selectedCategory) return currentResults;
     
-    return currentResults.filter(result => 
-      result.classification_process?.final_result?.category === selectedCategory
-    );
+    return currentResults.filter(result => {
+      // Only check the final classification category
+      return result?.classification_process?.final_result?.category === selectedCategory;
+    });
   };
+  
 
   const clearCategoryFilter = () => {
     setSelectedCategory(null);
@@ -226,11 +231,18 @@ const ClassificationDashboardContent = () => {
     try {
       setLoading(true);
       const result = await processEmailsMutation.mutateAsync({
-        totalEmails: 100,
-        batchSize: 50,
-        skip: currentSkip,
+        totalEmails: 200,
+        batchSize: processingBatchSize,
+       skip: processingSkip, 
       });
 
+      if (result.next_skip) {
+        setProcessingSkip(result.next_skip);
+        console.log("next skip",processingSkip)
+      } else {
+        // If no next_skip is provided, calculate it manually
+        setProcessingSkip(processingSkip + processingBatchSize); // batchSize is 50
+      }
       if (result.task_ids) {
         setActiveTaskIds(prev => [...prev, ...result.task_ids]);
       }
@@ -248,18 +260,18 @@ const ClassificationDashboardContent = () => {
   };
 
   const resetProcessing = () => {
-    setCurrentSkip(0);
+    setCurrentDisplaySkip(0);
     setSelectedCategory(null);
     setError(null);
     queryClient.invalidateQueries({ queryKey: ['classificationResults'] });
   };
 
-  if (resultsQuery.isLoading) {
+  if (isLoading) {
     return <div>Loading...</div>;
   }
 
-  if (resultsQuery.error) {
-    return <div>Error: {resultsQuery.error.message}</div>;
+  if (isError) {
+    return <div>Error: {resultsData.error.message}</div>;
   }
 
   // Get category summary for display
@@ -268,7 +280,8 @@ const ClassificationDashboardContent = () => {
     const currentResults = getCurrentResults();
     
     currentResults.forEach(result => {
-      const category = result.classification_process?.final_result?.category || 'Unknown';
+      // Use only the final classification category to be consistent
+      const category = result?.classification_process?.final_result?.category || 'Unknown';
       summary[category] = (summary[category] || 0) + 1;
     });
     
@@ -396,7 +409,41 @@ const ClassificationDashboardContent = () => {
           </CardContent>
         </Card>
       )}
-
+      {/*Pagination controls*/}
+      <div className="flex justify-between items-center mt-4">
+        <Button 
+          onClick={() => setCurrentDisplaySkip(Math.max(0, currentDisplaySkip - currentDisplayLimit))}
+          disabled={currentDisplaySkip === 0 || loading}
+          variant="outline"
+        >
+          Previous Page
+        </Button>
+        
+        <span className="text-sm">
+          {resultsData?.total ? (
+            // If we know the total, show accurate bounds
+            `Showing results ${Math.min(currentDisplaySkip + 1, resultsData.total)} - 
+            ${Math.min(currentDisplaySkip + filteredResults.length, resultsData.total)} 
+            of ${resultsData.total}`
+          ) : (
+            // If we don't know the total
+            `Showing results ${currentDisplaySkip + 1} - ${currentDisplaySkip + filteredResults.length}`
+          )}
+        </span>
+        
+        <Button 
+          onClick={() => setCurrentDisplaySkip(currentDisplaySkip + currentDisplayLimit)}
+          // Disable when we're at the end of data
+          disabled={
+            filteredResults.length < currentDisplayLimit || // Not a full page
+            (resultsData?.total && currentDisplaySkip + currentDisplayLimit >= resultsData.total) || // At the end
+            loading
+          }
+          variant="outline"
+        >
+          Next Page
+        </Button>
+      </div>
       {/* Display Results - Key fix: Use filteredResults consistently */}
       {filteredResults.length > 0 ? (
         filteredResults.map((result, idx) => (
